@@ -1,4 +1,6 @@
-# House Prices Regression
+# House Prices Regression (based on "Stacked Regressions: Top 4% on LeaderBoard"
+# notebook from Kaggle.com)
+
 #imports
 import pandas as pd
 import numpy as np
@@ -84,7 +86,6 @@ train['SalePrice'] = np.log1p(train['SalePrice'])
 
 #Look at target variable SalePrice now
 sns.distplot(train['SalePrice'], fit = norm)
-
 #Get fitted parameters (mean, st. dev.)
 (mu, sigma) = norm.fit(train['SalePrice'])
 print( '\n mu = {:.2f} and sigma = {:.2f}\n'.format(mu, sigma))
@@ -105,13 +106,6 @@ test_Id = test['Id']
 
 train.drop('Id', axis = 1, inplace = True)
 test.drop('Id', axis = 1, inplace = True)
-
-#Outliers - data indicated that there are some
-fix, ax = plt.subplots()
-ax.scatter(x = train['GrLivArea'], y = train['SalePrice'])
-plt.ylabel('SalePrice')
-plt.xlabel('GrLivArea')
-plt.show()
 
 #Missing data
 total = train.isnull().sum().sort_values(ascending = False)
@@ -271,6 +265,7 @@ for col in cols:
 #adding total squre footage of the house as a new feature
 df['TotalSF'] = df['TotalBsmtSF'] + df['1stFlrSF'] + df['2ndFlrSF']
 
+
 #splitting data back
 train = df[:ntrain]
 test = df[ntrain:]
@@ -299,25 +294,147 @@ fig = plt.figure()
 res = stats.probplot(train['LotArea'], plot = plt)
 plt.show() #more normally distributed
 
-#get dummy categorical features
-train = pd.get_dummies(train)
-test = pd.get_dummies(test)
+#creating dummies 
+df = pd.concat((train, test)).reset_index(drop = True)
+df = pd.get_dummies(df, drop_first = True)
+
+#spliting data
+train = df[:ntrain]
+test = df[ntrain:]
 
 #MODELING
+#define a cross validation strategy
+n_folds = 5
+
+def rmsle_cv(model):
+    kf = KFold(n_folds, shuffle = True, random_state=42).get_n_splits(train.values)
+    rmse = np.sqrt(-cross_val_score(model, train.values, y_train,
+                                    scoring ='neg_mean_squared_error', cv = kf))
+    return(rmse)
+
+#base models
+
+#lasso regression (may be sensitive to outliers, use robustscaller)
+lasso = make_pipeline(RobustScaler(), Lasso(alpha = 0.0005, random_state = 1))
+
+#Elastic Net Regression
+ENet = make_pipeline(RobustScaler(), ElasticNet(alpha = 0.0005, l1_ratio = .9,
+                                                random_state = 1))
+
+#Kernel Ridge Regression
+KRR = KernelRidge(alpha = 0.6, kernel = 'polynomial', degree = 2, coef0 = 2.5)
+
+#Gradient Boosting Regression
+GBoost = GradientBoostingRegressor(n_estimators = 3000, learning_rate = 0.05,
+                                   max_depth = 4, max_features = 'sqrt', 
+                                   min_samples_leaf = 15, min_samples_split = 10,
+                                   loss = 'huber', random_state = 1)
+
+#xgboost 
+xgboost = xgb.XGBRegressor(colsample_bytree=0.4603, gamma=0.0468, 
+                             learning_rate=0.05, max_depth=3, 
+                             min_child_weight=1.7817, n_estimators=2200,
+                             reg_alpha=0.4640, reg_lambda=0.8571,
+                             subsample=0.5213, silent=1,
+                             random_state =1, nthread = -1)
+
+#LightGBM
+lgb_model = lgb.LGBMRegressor(objective='regression',num_leaves=5,
+                              learning_rate=0.05, n_estimators=720,
+                              max_bin = 55, bagging_fraction = 0.8,
+                              bagging_freq = 5, feature_fraction = 0.2319,
+                              feature_fraction_seed=9, bagging_seed=9,
+                              min_data_in_leaf =6, min_sum_hessian_in_leaf = 11)
+
+#Evaluating these models
+
+score = rmsle_cv(lasso)
+print('\nLasso score: {:.4f} ({:.4f})\n'.format(score.mean(), score.std()))
+
+score = rmsle_cv(ENet)
+print('Elastic Net score: {:.4f} ({:.4f})\n'.format(score.mean(), score.std()))
+
+score = rmsle_cv(KRR)
+print('Kernel Ridge score: {:.4f} ({:.4f})\n'.format(score.mean(), score.std()))
+
+score = rmsle_cv(GBoost)
+print('Gradient Boosting score: {:.4f} ({:.4f})\n'.format(score.mean(), score.std()))
+
+score = rmsle_cv(xgboost)
+print('Xgboost score: {:.4f} ({:.4f})\n'.format(score.mean(), score.std()))
+
+score = rmsle_cv(lgb_model)
+print('LGBM score: {:.4f} ({:.4f})\n'.format(score.mean(), score.std()))
+
+#Stacking models
+#Creating a new class to average models
+class AveragingModels (BaseEstimator, RegressorMixin, TransformerMixin):
+    def __init__(self, models):
+        self.models = models
+        
+    #define clones of original models to fit the data
+    def fit(self, X, y):
+        self.models_ = [clone(x) for x in self.models]
+        
+    
+        #train cloned base models
+        for model in self.models_:
+            model.fit(X, y)
+        
+        return self
+
+    #predictions for cloned models and average
+    def predict(self, X):
+        predictions = np.column_stack([
+            model.predict(X) for model in self.models_
+        ])
+        return np.mean(predictions, axis = 1)
+
+#average of best performing models
+averaged_models = AveragingModels(models = (ENet, GBoost, KRR, lasso))
+
+score = rmsle_cv(averaged_models)
+print('Averaged base models score: {:.4f} ({:.4f})\n'.format(score.mean(), score.std()))        
+
+#Ensembling averaged_models, LightGBM, XGBoost
+
+#define evaluation function
+def rmsle(y, y_pred):
+    return np.sqrt(mean_squared_error(y, y_pred))
+
+#fitting and training the models
+    
+#stacked averaged model
+averaged_models.fit(train.values, y_train)
+avg_train_pred = averaged_models.predict(train.values)
+avg_pred = np.expm1(averaged_models.predict(test.values))
+print(rmsle(y_train, avg_train_pred))
+
+#xgboost
+xgboost.fit(train, y_train)
+xgb_train_pred = xgboost.predict(train)
+xgb_pred = np.expm1(xgboost.predict(test))
+print(rmsle(y_train, xgb_train_pred))
+
+#Light GBM model
+lgb_model.fit(train, y_train)
+lgb_train_pred = lgb_model.predict(train)
+lgb_pred = np.expm1(lgb_model.predict(test))
+print(rmsle(y_train, lgb_train_pred))
+
+#RMSLE on the train data
+print('RMSLE score on train data: ')
+print (rmsle(y_train, xgb_train_pred*0.70 + avg_train_pred*0.15 +
+             lgb_train_pred*0.15))
 
 
+ensemble =  xgb_pred*0.70 + avg_pred*0.15 + lgb_pred*0.15
 
-
-
-
-
-
-
-
-
-
-
-
+#Submission
+sub = pd.DataFrame()
+sub['Id'] = test_Id
+sub['SalePrice'] = ensemble
+sub.to_csv('submission.csv', index = False)
 
 
 
